@@ -1,0 +1,334 @@
+## RuntimeShield + VaultShield Notes — Full 30-Day Detailed Log
+
+---
+
+## SPRINT 1: Kernel Sensing Layer — "Teach the kernel to report everything happening on the system"
+
+**Day 1 — Environment Setup & Verification** ✅ *Completed*
+*What we did:* Verified Ubuntu kernel (6.17.0), confirmed `CONFIG_BPF=y`, `CONFIG_BPF_LSM=y`, `CONFIG_BPF_KPROBE_OVERRIDE=y` are all enabled in the kernel config. Installed `bpfcc-tools`, `python3-bpfcc`, `clang`, `llvm`, `libbpf-dev`. Confirmed BCC loads correctly in Python (`from bcc import BPF`). Ran the prebuilt `execsnoop-bpfcc` tool and watched it capture live process execution from Docker (`runc`), Postgres (`pg_isready`), and Redis (`redis-cli ping`) containers already running on the machine.
+*Why this mattered:* This proved, before writing a single line of our own code, that the machine is fully capable of loading and running kernel-level eBPF programs with root privileges, and that both detection mechanisms we'll need later (LSM hooks and kprobe override) are available as fallback options. Nothing in the rest of the project works without this layer functioning.
+
+**Day 2 — Write Our Own execve Probe**
+*What we do:* Replace the prebuilt `execsnoop` tool with our own minimal eBPF program using `TRACEPOINT_PROBE(sched, sched_process_exec)`, compiled and loaded via BCC, printing PID and command name whenever any process runs.
+*Why:* We need to own and control this code, not depend on a third-party binary, because every later feature (struct events, process trees, detection logic) gets built directly on top of this file.
+
+**Day 3 — Add File Access and Network Probes**
+*What we do:* Extend the same eBPF program with two more tracepoints: `syscalls:sys_enter_openat` (file access) and `syscalls:sys_enter_connect` (network connections).
+*Why:* Our two planned website vulnerabilities are command injection (needs process visibility) and file-read/LFI (needs file-access visibility), so the sensor must see both event types from day one.
+
+**Day 4 — Move to Structured Events via Ring Buffer**
+*What we do:* Replace crude `bpf_trace_printk` text output with a proper C `struct event { pid, ppid, comm, filename, timestamp }`, sent to user space through a BPF ring buffer instead of the kernel debug log.
+*Why:* Text parsing is unreliable and slow. A ring buffer gives clean, typed data — this is the difference between a "toy tracer" and something a real detection pipeline can consume.
+
+**Day 5 — Python Event Consumer + JSON Logging**
+*What we do:* Write the Python script that polls the ring buffer, decodes each struct into a dictionary, and writes it as a line of JSON to a log file in real time.
+*Why:* This JSON log becomes the single source of truth for everything downstream — the detection engine reads it, the enforcement layer reacts to it, and the dashboard displays it.
+
+**Day 6 — Process-Tree (PPID) Tracking**
+*What we do:* Make sure every captured event includes the parent PID, and build a small in-memory map of PID→PPID→command so we can reconstruct chains like `java(1001) → sh(1002) → cat(1003)`.
+*Why:* This parent-child chain is the actual signal we detect on later — "this process normally never has this child" is the entire basis of our anomaly detection, so it has to be solid before we go further.
+
+**Day 7 — Stability Test & Buffer Day**
+*What we do:* Run the full sensor (all three probes + ring buffer + JSON logging) continuously for 15+ minutes under normal laptop/Docker activity, watch for crashes, kernel verifier rejections, or memory leaks, and fix anything that surfaces.
+*Why:* Kernel-level bugs are the most unpredictable part of this whole project; this slot exists specifically to absorb that risk before we build the website on top of an unstable sensor.
+
+---
+
+## SPRINT 2: VaultShield Notes — Build the Vulnerable Website
+
+**Day 8 — Project Scaffold, Login Page, Dashboard Shell**
+*What we do:* Create the Spring Boot project (`vaultshield-target`) with Thymeleaf for HTML pages, a simple login screen (in-memory or hardcoded credentials are fine), and a dashboard page users land on after login.
+*Why:* For the demo to be convincing, this needs to look and feel like a real product with a UI, not a bare set of REST endpoints in Postman.
+
+**Day 9 — Network Diagnostics Page (Vulnerability #1: Command Injection)**
+*What we do:* Build a page with a form where a user enters a hostname to "ping," which the backend executes via `Runtime.exec("ping " + host)` with no input sanitization, and displays the raw output on the page.
+*Why:* This is the centerpiece exploit — a realistic feature (network diagnostics) that legitimately needs to run a shell command, making the vulnerability plausible rather than obviously planted.
+
+**Day 10 — Download Report Feature (Vulnerability #2: Local File Inclusion)**
+*What we do:* Build a page where a user requests a "report" by filename; the backend concatenates that filename directly into a file path and returns the contents, with no path validation.
+*Why:* Gives the project a second, different exploit class, so the agent's detection breadth (not just one trick) is demonstrated.
+
+**Day 11 — Legitimate "Normal Use" Pages**
+*What we do:* Add a couple of harmless pages — viewing saved notes, dashboard stats — that involve no shell commands or file reads outside the expected scope.
+*Why:* This is the traffic we'll use later to prove the agent doesn't falsely flag normal usage; without it we have no baseline of "good" behavior to contrast against attacks.
+
+**Day 12 — Dockerize the Website (App + Postgres + Redis)**
+*What we do:* Write `Dockerfile` and `docker-compose.yml` wiring the Spring Boot app to Postgres and Redis containers, matching the containers already visible in your Day 1 execsnoop capture.
+*Why:* Gives us a clean, resettable environment we can tear down and rebuild instantly before every demo run, and makes the project look like a real multi-service deployment.
+
+**Day 13 — Manually Verify Both Exploits Work**
+*What we do:* Confirm `host=8.8.8.8;cat /etc/passwd` on the diagnostics page actually leaks file contents into the response; confirm a crafted `filename=../../etc/passwd` does the same on the report page.
+*Why:* This is the evidence for "Scene 1" of our demo (vulnerable, undefended). It must be airtight and repeatable before we build any defense around it.
+
+**Day 14 — Capture Baseline ("Normal") Behavior with the Sensor**
+*What we do:* Browse the website normally (login, view notes, check dashboard) with Sprint 1's sensor running, and save that event log as our reference of expected behavior.
+*Why:* This becomes the lookup table our detection logic compares against — we can't define "abnormal" without first defining "normal" from real captured data.
+
+**Day 15 — Capture Attack Behavior with the Sensor**
+*What we do:* Trigger both exploits while the sensor runs, and confirm we can clearly see `java → sh → cat /etc/passwd` and `java → ping` chains in the JSON log.
+*Why:* Proves the sensing layer has full visibility into both attack types before we write any detection code on top of it — if the sensor can't see it, nothing downstream can catch it.
+
+---
+
+## SPRINT 3: Detection + Enforcement — The Actual "Agent"
+
+**Day 16 — Baseline Table + Detection Rule #1 (Command Injection)**
+*What we do:* Encode the Day 14 baseline as a Python dictionary (expected children per process), and write a rule that flags any child process spawned by the Java app that isn't in that list, tagging it "RCE Detected."
+*Why:* This is the core logic that turns raw event data into an actual security alert for our first vulnerability class.
+
+**Day 17 — Detection Rule #2 (File Access / LFI)**
+*What we do:* Add a rule flagging access to sensitive paths (`/etc/passwd`, `/etc/shadow`, anything outside the app's expected file directory) as "LFI Detected."
+*Why:* Covers our second vulnerability — now the agent detects two distinct, named exploit categories, matching the breadth promised in your original SRS document.
+
+**Day 18 — Choose Enforcement Mechanism + Build the Blocklist Map**
+*What we do:* Since Day 1 confirmed `CONFIG_BPF_LSM=y`, we use an LSM hook (the cleaner, more "production-grade" mechanism) rather than the kprobe-override fallback. Create a BPF hash map keyed by PID, currently empty.
+*Why:* This map is the shared memory between user-space (which decides what's malicious) and kernel-space (which actually blocks it) — the bridge that makes real-time enforcement possible.
+
+**Day 19 — Build the Enforcement Hook**
+*What we do:* Attach an LSM probe (e.g., `bprm_check_security` for process execution, or a file-open hook for LFI) that checks the blocklist map before allowing the action, returning `-EPERM` if the PID is listed.
+*Why:* This is the actual kernel-level "shield" — code sitting on the critical path of every relevant syscall, able to refuse it outright.
+
+**Day 20 — Wire Detection to Enforcement Automatically**
+*What we do:* Modify the Day 16/17 detection logic so that the moment a rule fires, it immediately writes the offending PID into the blocklist map via BCC's map API — no manual step.
+*Why:* This automatic connection is what makes the system "autonomous" rather than just a monitoring dashboard a human has to act on.
+
+**Day 21 — Full End-to-End Test (The Core Proof)**
+*What we do:* Trigger an exploit once — it succeeds, gets logged as detected. Trigger the identical exploit again immediately — it now fails, blocked by the kernel.
+*Why:* This exact sequence (succeed once, blocked forever after) is the literal core proof-of-concept for the entire project and the foundation of your final demo's "Act 2 → Act 3" transition.
+
+**Day 22 — Block Expiry + Whitelist Protection**
+*What we do:* Add a time-to-live on blocklist entries (so PIDs don't stay blocked forever once reused by the OS), and explicitly whitelist the Day 11 legitimate pages so they can never trigger a false block.
+*Why:* Protects against two failure modes: blocking an innocent process that later reuses a flagged PID, and accidentally breaking normal site functionality during the live demo.
+
+**Day 23 — Stress Test Both Exploits + Legit Traffic in Parallel**
+*What we do:* Script 20+ rapid repeated attempts of both exploits while simultaneously generating normal traffic on the legit pages, and confirm: consistent detection/blocking on attacks, zero false positives on legitimate use.
+*Why:* This produces the actual number ("0 false positives over N requests") that goes directly into your results table and is often the single most convincing statistic in a viva.
+
+---
+
+## SPRINT 4: Dashboard, Evidence, Demo, Final Report
+
+**Day 24 — Build the RuntimeShield Live Dashboard**
+*What we do:* A simple auto-refreshing HTML page showing live stats: Threats Detected, Threats Blocked, System Status ("Protected"), and a scrolling feed of recent events, all pulled from the JSON log.
+*Why:* Turns raw terminal logs into something a non-technical evaluator can read on a projector at a glance — visual proof matters as much as backend correctness for grading.
+
+**Day 25 — Measure Real Performance Numbers**
+*What we do:* Pull detection latency, rule-injection latency, and block-confirmation latency directly from log timestamps; measure CPU overhead with `pidstat`/`top` while the agent runs under load. Compare all of this against the targets stated in your own SRS (<10ms detection, <100ms injection, <5% CPU).
+*Why:* Gives the report defensible, specific numbers instead of a vague "it works" claim.
+
+**Day 26 — Build the Automated Attack Script**
+*What we do:* A script that automatically performs the full demo sequence — attack with agent off, attack with agent on (detected), repeat attack (blocked), then legit traffic — without manual clicking.
+*Why:* Removes human error and timing inconsistency from the live demo, and produces a clean, repeatable recording.
+
+**Day 27 — Record the Full Demo**
+*What we do:* Screen-record the entire sequence: site exploited with data visibly leaking on screen (agent off) → agent turned on → same exploit detected and blocked live, dashboard updating in real time → legitimate use shown working normally throughout.
+*Why:* This video becomes your safety net if anything glitches during the live evaluation, and is strong standalone evidence either way.
+
+**Day 28 — Build Results Table + Write Report Findings**
+*What we do:* Construct the before/after comparison table (Agent Off vs Agent On for both exploits, plus legit traffic), attach latency numbers from Day 25, attach screenshots of the leaked-data page next to the blocked-request page.
+*Why:* Direct visual before/after evidence tied to your synopsis's stated objectives is the strongest possible grading evidence — it's not abstract, it's "look, same input, different outcome."
+
+**Day 29 — Polish Full Report and Slide Deck**
+*What we do:* Finalize all report sections (Methodology, SRS, Results) using the explanations accumulated across this entire 30-day log; build a slide deck mirroring the demo's 3-act structure (vulnerable → detected → blocked).
+*Why:* Minimal new writing needed since every day's "why" already maps directly onto your existing report structure.
+
+**Day 30 — Full Dry Run and Final Submission**
+*What we do:* Run the complete live demo end-to-end exactly as planned for evaluation day — environment startup, attack script, dashboard, results — fix anything that breaks, then submit code, report, and video.
+*Why:* Final safety check against environment surprises (Docker not starting cleanly, port conflicts, stale containers) before the actual presentation.
+
+---
+
+Two flagged risk points worth remembering as you go: Days 18–21 (LSM enforcement) are the technically hardest stretch — if LSM hooks misbehave, your confirmed fallback is kprobe-override (already enabled in your kernel). And Day 24's dashboard should stay deliberately simple — a clean refreshing page beats a half-working real-time WebSocket setup that risks breaking mid-demo.
+
+runtimeshield-demo/                          # 📦 Root Project Folder
+│
+├── README.md                                # Overview of the entire project
+│
+├── vaultshield-notes/                       # 🎯 PART 1: The Vulnerable Website (Spring Boot, Port 8080)
+│   ├── pom.xml
+│   ├── src/
+│   │   └── main/
+│   │       ├── java/com/vaultshield/notes/
+│   │       │   ├── VaultshieldNotesApplication.java
+│   │       │   ├── config/
+│   │       │   │   └── SecurityConfig.java
+│   │       │   ├── controller/
+│   │       │   │   ├── LoginController.java
+│   │       │   │   ├── DashboardController.java
+│   │       │   │   ├── DiagnosticsController.java   # Day 9 (Command Injection)
+│   │       │   │   └── ReportController.java        # Day 10 (LFI)
+│   │       │   └── service/
+│   │       │       └── NoteService.java
+│   │       └── resources/
+│   │           ├── application.properties      (server.port=8080)
+│   │           └── templates/
+│   │               ├── login.html
+│   │               ├── dashboard.html
+│   │               ├── diagnostics.html
+│   │               └── report.html
+│   └── target/
+│
+├── vaultshield-dashboard/                   # 📊 PART 2: Live Monitoring Dashboard (Spring Boot, Port 8081)
+│   ├── pom.xml                              # Same dependencies: Web + Thymeleaf
+│   ├── src/
+│   │   └── main/
+│   │       ├── java/com/vaultshield/dashboard/
+│   │       │   ├── VaultshieldDashboardApplication.java
+│   │       │   ├── controller/
+│   │       │   │   └── DashboardController.java   # Serves HTML + /api/events
+│   │       │   └── service/
+│   │       │       └── EventLogService.java       # Reads logs/events.json
+│   │       └── resources/
+│   │           ├── application.properties      (server.port=8081)
+│   │           └── templates/
+│   │               └── dashboard.html          # Auto-refreshing UI
+│   └── target/
+│
+├── runtimeshield-agent/                     # 🛡️ PART 3: The Protection Agent (Python + eBPF)
+│   ├── requirements.txt                      # bcc-python, etc.
+│   ├── sensor.py                             # eBPF probes
+│   ├── detector.py                           # Anomaly rules
+│   ├── enforcer.py                           # LSM blocklist
+│   ├── agent_main.py                         # Orchestrator
+│   ├── config/
+│   │   ├── baseline.json
+│   │   └── rules.yaml
+│   └── logs/                                 # 📁 SHARED LOG DIRECTORY (mounted by both Java apps)
+│       ├── events.json                       # Raw events (sensor writes, dashboard reads)
+│       └── alerts.json                       # Detection/block events
+│
+├── scripts/                                  # 🎬 PART 4: Automation
+│   ├── attack.py
+│   ├── stress_test.py
+│   └── demo_runner.sh                        # Starts ALL 3 apps (Notes + Dashboard + Agent)
+│
+├── docs/                                     # 📄 PART 5: Final Submission
+│   ├── report.pdf
+│   ├── presentation.pptx
+│   └── screenshots/
+│
+└── docker-compose.yml                        # 🐳 Postgres + Redis (optional)
+
+
+
+SPRINT 1: Kernel Sensing Layer (Days 2-7)
+Goal: Build the sensor that captures all system events
+
+Day	Task	Deliverable	Time
+2	Write our own execve probe	Working sensor that captures process executions	2 hrs
+3	Add openat (file access) and connect (network) probes	Full sensor with 3 probes	2 hrs
+4	Move to structured events via ring buffer	Clean C struct + ring buffer	2 hrs
+5	Python event consumer + JSON logging	events.json being written in real-time	2 hrs
+6	Process-tree (PPID) tracking	PID→PPID→comm map built	2 hrs
+7	Stability test & buffer day	Bug fixes, performance tuning	2 hrs
+By the end of Sprint 1: You have a fully functional sensor that logs every process, file access, and network connection!
+
+SPRINT 2: Build Vulnerable Website (Days 8-15)
+Goal: Build the target application with vulnerabilities
+
+Day	Task	Deliverable	Time
+8	Project scaffold, login page, dashboard shell	Working Spring Boot app with login	2 hrs
+9	Network Diagnostics page (Command Injection)	Vulnerable ping page	2 hrs
+10	Download Report feature (LFI)	Vulnerable file reader	2 hrs
+11	Legitimate "Normal Use" pages	Notes, dashboard stats	2 hrs
+12	Dockerize the website (App + Postgres + Redis)	docker-compose.yml working	2 hrs
+13	Manually verify both exploits work	Screenshots of leaked data	2 hrs
+14	Capture baseline behavior with sensor	baseline.json created	2 hrs
+15	Capture attack behavior with sensor	Attack logs captured	2 hrs
+By the end of Sprint 2: You have a vulnerable website and proof it can be exploited!
+
+SPRINT 3: Detection + Enforcement (Days 16-23)
+Goal: Build the intelligence that detects and blocks attacks
+
+Day	Task	Deliverable	Time
+16	Baseline table + Detection Rule #1 (RCE)	Detects command injection	2 hrs
+17	Detection Rule #2 (LFI)	Detects file inclusion	2 hrs
+18	Choose enforcement + Build blocklist map	BPF hash map created	2 hrs
+19	Build the enforcement hook (LSM)	LSM probe blocks processes	2 hrs
+20	Wire detection to enforcement automatically	End-to-end automation	2 hrs
+21	Full end-to-end test	First attempt fails, second blocked	2 hrs
+22	Block expiry + whitelist protection	TTL on blocks, whitelist added	2 hrs
+23	Stress test both exploits + legit traffic	Performance validation	2 hrs
+By the end of Sprint 3: You have a fully autonomous protection agent!
+
+SPRINT 4: Dashboard + Demo + Report (Days 24-30)
+Goal: Present the complete solution
+
+Day	Task	Deliverable	Time
+24	Build the RuntimeShield Live Dashboard	Live monitoring UI	2 hrs
+25	Measure real performance numbers	Latency, CPU overhead stats	2 hrs
+26	Build the automated attack script	Auto demo script	2 hrs
+27	Record the full demo	Screen recording	2 hrs
+28	Build results table + write findings	Before/after comparison	2 hrs
+29	Polish full report and slide deck	Final documentation	2 hrs
+30	Full dry run + final submission	Everything tested and ready	2 hrs
+By the end of Sprint 4: You have a complete project ready for submission!
+
+
+vanguard-demo/                              ← MASTER FOLDER
+│
+├── vanguard-agent/                         ← Python + eBPF Agent
+│   ├── sensor.py                           ← Day 2-5 (Building NOW)
+│   ├── detector.py                         ← Day 16-17
+│   ├── enforcer.py                         ← Day 18-20
+│   ├── agent_main.py                       ← Day 20
+│   ├── requirements.txt
+│   ├── config/
+│   │   ├── baseline.json                   ← Day 14
+│   │   └── rules.yaml
+│   └── logs/                               ← SHARED LOGS
+│       ├── events.json                     ← Raw events
+│       └── alerts.json                     ← Detection alerts
+│
+├── vanguard-target/                        ← Vulnerable Website (Spring Boot)
+│   ├── pom.xml
+│   ├── src/
+│   │   └── main/
+│   │       ├── java/com/vanguard/target/
+│   │       │   ├── VanguardTargetApplication.java
+│   │       │   ├── config/
+│   │       │   │   └── SecurityConfig.java
+│   │       │   ├── controller/
+│   │       │   │   ├── LoginController.java
+│   │       │   │   ├── DashboardController.java
+│   │       │   │   ├── DiagnosticsController.java  ← Day 9 (RCE)
+│   │       │   │   └── ReportController.java       ← Day 10 (LFI)
+│   │       │   └── service/
+│   │       │       └── NoteService.java
+│   │       └── resources/
+│   │           ├── application.properties
+│   │           └── templates/
+│   │               ├── login.html
+│   │               ├── dashboard.html
+│   │               ├── diagnostics.html
+│   │               └── reports.html
+│   └── target/
+│
+├── vanguard-dashboard/                     ← Live Dashboard (Spring Boot)
+│   ├── pom.xml
+│   ├── src/
+│   │   └── main/
+│   │       ├── java/com/vanguard/dashboard/
+│   │       │   ├── VanguardDashboardApplication.java
+│   │       │   ├── controller/
+│   │       │   │   └── DashboardController.java
+│   │       │   └── service/
+│   │       │       └── EventLogService.java
+│   │       └── resources/
+│   │           ├── application.properties
+│   │           └── templates/
+│   │               └── dashboard.html
+│   └── target/
+│
+├── scripts/                                ← Automation Scripts
+│   ├── attack.py
+│   ├── stress_test.py
+│   └── demo_runner.sh
+│
+├── docs/                                   ← Documentation
+│   ├── report.md
+│   └── screenshots/
+│
+└── README.md
+
+# eBPF-powered-runtime-protection

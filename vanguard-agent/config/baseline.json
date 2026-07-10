@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "description": "Baseline behavior for Vanguard detection",
+  "allowed_processes": {
+    "java": ["ping", "redis-cli", "pg_isready", "sh"],
+    "python": ["python", "pip", "django"],
+    "docker": ["runc", "containerd", "docker"]
+  },
+  "sensitive_paths": [
+    "/etc/passwd",
+    "/etc/shadow",
+    "/etc/sudoers",
+    "/root/",
+    "/home/",
+    "/var/log/"
+  ],
+  "created": "2026-07-02T06:00:00",
+  "events_captured": 0
+}
